@@ -1,0 +1,6 @@
+flask>=3.0
+flask-sock>=0.7
+psutil>=5.9
+paramiko>=3.4
+simple-websocket>=1.0
+websocket-client>=1.8
