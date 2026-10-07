@@ -2,7 +2,7 @@
 
 Web app all-in-one untuk monitoring server Linux: dashboard real-time, file manager, Web SSH (terminal di browser), dan remote desktop LXQt via noVNC — semuanya dalam satu dashboard bertab dengan satu login.
 
-![tabs](https://img.shields.io/badge/tabs-4-blue) ![python](https://img.shields.io/badge/python-3.9%2B-green)
+![tabs](https://img.shields.io/badge/tabs-5-blue) ![python](https://img.shields.io/badge/python-3.9%2B-green)
 
 ## Fitur
 
@@ -11,11 +11,13 @@ Web app all-in-one untuk monitoring server Linux: dashboard real-time, file mana
 | **Monitoring** | CPU, RAM, disk, network, load average, daftar proses — update real-time |
 | **File Manager** | Browse, upload, download, edit, rename, mkdir, delete file/folder (guard path traversal) |
 | **Web SSH** | Terminal interaktif di browser (Paramiko + xterm.js), auto-resize, scrollback 2000 |
-| **Desktop** | Remote desktop LXQt via noVNC, auto-scale, fullscreen |
+| **Desktop** | Remote desktop LXQt via noVNC, auto-scale, fullscreen, tombol Start/Stop (hemat RAM) |
+| **Settings** | Ganti password login (berlaku langsung tanpa restart), tema System/Dark/Light, interval polling 2–30s, VNC autostart |
 
-- **Auth tunggal**: basic-auth untuk semua HTTP + session token untuk WebSocket
+- **Auth tunggal**: basic-auth untuk semua HTTP + session token (kedaluwarsa 1 jam) untuk WebSocket
 - **SSH key-based**: Web SSH memakai SSH key lokal, bukan password
 - **VNC localhost-only**: remote desktop tidak pernah terekspos langsung; semua lewat proxy Flask yang ter-auth
+- **Theme switch**: System/Dark/Light, preferensi di localStorage + `settings.json`
 
 ## Arsitektur
 

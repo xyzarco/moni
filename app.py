@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Server Monitor + Web SSH — dashboard monitoring & terminal SSH di browser."""
-import json, os, socket, time, getpass
+import json, os, socket, time, getpass, subprocess
 import psutil
 from flask import Flask, Response, request
 from flask_sock import Sock
@@ -29,16 +29,30 @@ SSH_HOST = os.environ.get("SSH_HOST", "127.0.0.1")
 SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
 SSH_USER = os.environ.get("SSH_USER", getpass.getuser())
 PORT = int(os.environ.get("PORT", "8080"))
+ENV_FILE = os.environ.get("MONITOR_ENV", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".monitor.env"))
+
+
+def current_pass():
+    """Password aktif: selalu baca ulang .monitor.env agar ganti password via UI
+    berlaku langsung tanpa restart."""
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                if line.startswith("MONITOR_PASS="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return APP_PASS
 
 
 def check_auth():
     auth = request.authorization
-    return auth and auth.username == APP_USER and auth.password == APP_PASS
+    return auth and auth.username == APP_USER and auth.password == current_pass()
 
 
 # ---- Session token auth (untuk WebSocket, yang tidak memicu prompt browser) ----
 import secrets
-SESSION_TOKENS = set()
+SESSION_TOKENS = {}  # tok -> waktu dibuat (detik)
 
 
 @app.route("/api/session", methods=["POST"])
@@ -47,16 +61,21 @@ def new_session():
     if not check_auth():
         return Response("Auth required", 401, {"WWW-Authenticate": "Basic realm=ServerMonitor"})
     tok = secrets.token_urlsafe(24)
-    SESSION_TOKENS.add(tok)
+    now = time.time()
+    for t, ts in list(SESSION_TOKENS.items()):
+        if now - ts > 3600:
+            del SESSION_TOKENS[t]
+    SESSION_TOKENS[tok] = now
     return {"token": tok}
 
 
 def ws_authorized():
-    """Auth untuk WebSocket: token sesi via query ?t=, atau basic-auth."""
+    """Auth untuk WebSocket: token sesi via query ?t= (maks. 1 jam), atau basic-auth."""
     if check_auth():
         return True
     tok = request.args.get("t", "")
-    return tok in SESSION_TOKENS
+    ts = SESSION_TOKENS.get(tok)
+    return ts is not None and time.time() - ts <= 3600
 
 
 from filemanager import fm_bp  # noqa: E402 — register /api/fs/* routes
@@ -106,6 +125,137 @@ def index():
     if not check_auth():
         return Response("Auth required", 401, {"WWW-Authenticate": "Basic realm=ServerMonitor"})
     return INDEX_HTML
+
+
+# ===== VNC session lifecycle (start/stop untuk hemat resource) =====
+def _vnc_running():
+    """True bila ada proses Xtigervnc yang listen di display :1."""
+    try:
+        out = subprocess.run(["pgrep", "-af", "Xtigervnc :1"],
+                             capture_output=True, text=True, timeout=5).stdout
+        return bool(out.strip())
+    except Exception:
+        return False
+
+
+def _vnc_autostart_if_enabled():
+    """Start VNC di background bila setting vnc_autostart aktif."""
+    if load_settings().get("vnc_autostart") and not _vnc_running():
+        subprocess.Popen(["/bin/bash", os.path.expanduser("~/.vnc/start-desktop.sh")],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+
+@app.route("/api/vnc", methods=["GET", "POST"])
+def vnc_api():
+    if not check_auth():
+        return {"error": "unauthorized"}, 401
+    if request.method == "GET":
+        return {"running": _vnc_running()}
+
+    action = (request.get_json(silent=True) or {}).get("action", "")
+    if action == "toggle":
+        action = "stop" if _vnc_running() else "start"
+
+    if action == "stop":
+        subprocess.run(["vncserver", "-kill", ":1"],
+                       capture_output=True, text=True, timeout=15)
+        time.sleep(1)
+        return {"running": _vnc_running(), "action": "stop"}
+
+    if action == "start":
+        if _vnc_running():
+            return {"running": True, "action": "start", "note": "sudah berjalan"}
+        # jalankan script desktop; latar belakang agar tidak memblok request
+        subprocess.Popen(["/bin/bash", os.path.expanduser("~/.vnc/start-desktop.sh")],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        # beri waktu vncserver naik
+        for _ in range(10):
+            time.sleep(1)
+            if _vnc_running():
+                break
+        return {"running": _vnc_running(), "action": "start"}
+
+    return {"error": "action harus start|stop"}, 400
+
+
+# ===== Settings (disimpan ke settings.json) =====
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+DEFAULT_SETTINGS = {"vnc_autostart": False, "poll_interval": 3, "theme": "system"}
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE) as f:
+            s = json.load(f)
+    except Exception:
+        s = {}
+    out = dict(DEFAULT_SETTINGS)
+    out.update({k: v for k, v in s.items() if k in DEFAULT_SETTINGS})
+    return out
+
+
+def save_settings(s):
+    tmp = SETTINGS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=2)
+    os.replace(tmp, SETTINGS_FILE)
+
+
+@app.route("/api/settings", methods=["GET", "POST"])
+def settings_api():
+    if not check_auth():
+        return {"error": "unauthorized"}, 401
+    if request.method == "GET":
+        return load_settings()
+    body = request.get_json(silent=True) or {}
+    s = load_settings()
+    if "vnc_autostart" in body:
+        s["vnc_autostart"] = bool(body["vnc_autostart"])
+    if "poll_interval" in body:
+        try:
+            v = int(body["poll_interval"])
+        except (TypeError, ValueError):
+            return {"error": "poll_interval harus angka"}, 400
+        if not 2 <= v <= 30:
+            return {"error": "poll_interval harus 2-30 detik"}, 400
+        s["poll_interval"] = v
+    if "theme" in body:
+        if body["theme"] not in ("system", "dark", "light"):
+            return {"error": "theme harus system|dark|light"}, 400
+        s["theme"] = body["theme"]
+    save_settings(s)
+    return s
+
+
+@app.route("/api/password", methods=["POST"])
+def password_api():
+    if not check_auth():
+        return {"error": "unauthorized"}, 401
+    body = request.get_json(silent=True) or {}
+    old, new = body.get("old", ""), body.get("new", "")
+    if old != current_pass():
+        return {"error": "Password lama salah"}, 403
+    if len(new) < 8:
+        return {"error": "Password baru minimal 8 karakter"}, 400
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".monitor.env")
+    lines = []
+    with open(env_path) as f:
+        lines = f.readlines()
+    found = False
+    for i, l in enumerate(lines):
+        if l.startswith("MONITOR_PASS="):
+            lines[i] = f"MONITOR_PASS={new}\n"
+            found = True
+    if not found:
+        lines.append(f"MONITOR_PASS={new}\n")
+    tmp = env_path + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(lines)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, env_path)
+    return {"ok": True, "note": "Login ulang dengan password baru setelah dialog ini"}
 
 
 @app.route("/api/stats")
@@ -183,7 +333,10 @@ def ssh_ws(ws):
             break
         if data is None:
             continue
-        msg = json.loads(data) if data.startswith("{") else {"d": data}
+        try:
+            msg = json.loads(data) if data.startswith("{") else {"d": data}
+        except (ValueError, IndexError):
+            msg = {"d": data}
         if "r" in msg:  # resize
             chan.resize_pty(width=msg["r"]["c"], height=msg["r"]["r"])
         elif "d" in msg:
@@ -205,6 +358,8 @@ INDEX_HTML = r"""<!doctype html>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#0a0d10;--panel:#12171c;--line:#202830;--txt:#d7dfe6;--dim:#7c8a95;--ac:#9dce6a;--warn:#e0b34c;--err:#e06c5c;--acdim:#3a4a30}
+html[data-theme="light"]{--bg:#f4f6f4;--panel:#ffffff;--line:#dde3da;--txt:#1d2720;--dim:#5d6b60;--ac:#5e9430;--warn:#a97b18;--err:#c04a3a;--acdim:#dcecc8}
+html[data-theme="light"] ::selection{color:#fff}
 *{box-sizing:border-box;margin:0}
 html{-webkit-text-size-adjust:100%}
 body{background:var(--bg);color:var(--txt);font:14px/1.5 "JetBrains Mono",ui-monospace,Menlo,monospace;padding:20px 20px 40px;max-width:1080px;margin:0 auto}
@@ -233,7 +388,8 @@ tbody tr:last-child td{border-bottom:none}
 th{color:var(--dim);font-weight:400;text-transform:uppercase;font-size:10px;letter-spacing:.08em}
 td.num{text-align:right;font-variant-numeric:tabular-nums}
 th.num{text-align:right}
-#term{height:440px;border-radius:10px;overflow:hidden;border:1px solid var(--line);background:#0b0e11;padding:8px}
+#term{height:440px;border-radius:10px;overflow:hidden;border:1px solid var(--line);background:var(--term-bg,#0b0e11);padding:8px}
+html[data-theme="light"]{--term-bg:#fbfcfa}
 #term .xterm,#term .xterm .xterm-viewport{height:100%!important}
 #term .xterm-screen{height:auto!important}
 .hidden{display:none}
@@ -249,7 +405,30 @@ th.num{text-align:right}
 .fmname{color:var(--txt);cursor:pointer;background:none;border:none;font:inherit;font-size:12.5px;text-align:left;padding:0}
 .fmname:hover{color:var(--ac);text-decoration:underline}
 .fmact{display:flex;gap:4px;justify-content:flex-end}
-</style></head><body>
+.setgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.setlabel{display:block;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin:10px 0 4px}
+.setrow{display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer}
+.setrow input[type=checkbox]{width:16px;height:16px;accent-color:var(--ac);cursor:pointer}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;margin-top:4px}
+.segbtn{background:none;border:none;border-right:1px solid var(--line);color:var(--dim);font:inherit;font-size:12.5px;padding:8px 14px;cursor:pointer}
+.segbtn:last-child{border-right:none}
+.segbtn:hover{color:var(--txt)}
+.segbtn.on{background:var(--acdim);color:var(--txt);font-weight:700}
+html[data-theme="light"] .segbtn.on{background:var(--acdim)}
+input[type=password],input[type=number]{-webkit-text-security:disc}
+input[type=number]{-webkit-text-security:none}
+input:focus-visible,button:focus-visible{outline:2px solid var(--ac);outline-offset:1px}
+#pwMsg.ok,#setMsg.ok{color:var(--ac)}
+#pwMsg.bad,#setMsg.bad{color:var(--err)}
+::selection{background:var(--ac);color:#0a0d10}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px}
+::-webkit-scrollbar-thumb:hover{background:var(--acdim)}
+.setgrid>.panel{align-self:start}
+#setInfo{color:var(--txt)}
+</style>
+<script>try{var p=localStorage.getItem('themePref')||'system';document.documentElement.dataset.theme=p==='light'||p==='dark'?p:(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark')}catch(e){}</script></head><body>
 <h1><span class="mark">▸</span><span id="hn">Server</span><span style="color:var(--dim);font-weight:400">Monitor</span></h1>
 <div class="statusline">
   <span class="pill" id="live"><i></i>live</span>
@@ -260,6 +439,7 @@ th.num{text-align:right}
   <button class="tab" data-t="files" role="tab">File Manager</button>
   <button class="tab" data-t="ssh" role="tab">Web SSH</button>
   <button class="tab" data-t="desktop" role="tab">Desktop</button>
+  <button class="tab" data-t="settings" role="tab">Settings</button>
 </div>
 <div id="dash" role="tabpanel">
   <div class="grid">
@@ -297,10 +477,57 @@ th.num{text-align:right}
 </div>
 <div id="desktop" class="hidden" role="tabpanel">
   <div class="fmbar">
-    <span class="sub" style="flex:1">Desktop LXQt via noVNC — password VNC: sama dengan login dashboard</span>
+    <span class="pill" id="vncPill">memeriksa…</span>
+    <span class="sub" style="flex:1">Desktop LXQt via noVNC — hemat resource: matikan saat tidak dipakai</span>
+    <button class="btn" id="vncToggle">⏻ Start</button>
     <button class="btn" id="vncFull">Layar penuh ⛶</button>
   </div>
-  <iframe id="vncFrame" src="about:blank" style="width:100%;height:640px;border:1px solid var(--line);border-radius:10px;background:#0b0e11"></iframe>
+  <iframe id="vncFrame" src="about:blank" style="width:100%;height:640px;border:1px solid var(--line);border-radius:10px;background:var(--term-bg,#0b0e11)"></iframe>
+</div>
+<div id="settings" class="hidden" role="tabpanel">
+  <div class="setgrid">
+    <div class="panel">
+      <h3>Ganti password login</h3>
+      <label class="setlabel" for="pwOld">Password saat ini</label>
+      <input type="password" id="pwOld" class="fmpath" autocomplete="current-password" style="width:100%">
+      <label class="setlabel" for="pwNew">Password baru (min. 8 karakter)</label>
+      <input type="password" id="pwNew" class="fmpath" autocomplete="new-password" style="width:100%">
+      <label class="setlabel" for="pwNew2">Ulangi password baru</label>
+      <input type="password" id="pwNew2" class="fmpath" autocomplete="new-password" style="width:100%">
+      <div class="fmbar" style="margin-top:12px">
+        <button class="btn" id="pwSave">Simpan password</button>
+        <span class="sub" id="pwMsg" style="flex:1;margin:0"></span>
+      </div>
+      <div class="sub">Catatan: berlaku untuk dashboard &amp; semua API. Browser akan meminta login ulang.</div>
+    </div>
+    <div class="panel">
+      <h3>Tampilan</h3>
+      <div class="seg" role="radiogroup" aria-label="Tema tampilan">
+        <button class="segbtn" data-theme="system" role="radio" aria-checked="false">◐ System</button>
+        <button class="segbtn" data-theme="dark" role="radio" aria-checked="false">● Dark</button>
+        <button class="segbtn" data-theme="light" role="radio" aria-checked="false">○ Light</button>
+      </div>
+      <div class="sub" id="themeHint">System mengikuti pengaturan perangkat.</div>
+    </div>
+    <div class="panel">
+      <h3>Desktop remote</h3>
+      <label class="setrow"><input type="checkbox" id="setVncAuto"> Start VNC otomatis saat dashboard dinyalakan</label>
+      <div class="sub">Nonaktif = hemat RAM; tab Desktop tetap bisa di-start manual kapan saja.</div>
+    </div>
+    <div class="panel">
+      <h3>Monitoring</h3>
+      <label class="setlabel" for="setPoll">Interval pembaruan data (detik, 2–30)</label>
+      <input type="number" id="setPoll" class="fmpath" min="2" max="30" style="width:120px">
+      <div class="fmbar" style="margin-top:12px">
+        <button class="btn" id="setSave">Simpan pengaturan</button>
+        <span class="sub" id="setMsg" style="flex:1;margin:0"></span>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Tentang</h3>
+      <div class="sub" style="margin-top:0">Moni — server monitor all-in-one.<br>Monitoring · File Manager · Web SSH · Desktop noVNC<br><span id="setInfo"></span></div>
+    </div>
+  </div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
@@ -341,21 +568,39 @@ async function poll(){
     $('clock').textContent=new Date().toLocaleTimeString('id-ID');
   }catch(e){$('live').className='pill err';$('clock').textContent='koneksi terputus'}
 }
-setInterval(poll,3000);poll();
+let _pollTimer=null;
+poll();
+(async()=>{try{const s=await (await fetch('/api/settings')).json();if(s.poll_interval)window._pollInterval=s.poll_interval;}catch(e){}
+  _pollTimer=setInterval(poll,(window._pollInterval||3)*1000);})();
 
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   document.querySelectorAll('.tab').forEach(x=>{x.classList.remove('on');x.setAttribute('aria-selected','false')});
   t.classList.add('on');t.setAttribute('aria-selected','true');
-  ['dash','files','ssh','desktop'].forEach(id=>document.getElementById(id).classList.toggle('hidden',t.dataset.t!==id));
+  ['dash','files','ssh','desktop','settings'].forEach(id=>document.getElementById(id).classList.toggle('hidden',t.dataset.t!==id));
   document.getElementById('fmEditor').classList.add('hidden');
+  if(t.dataset.t==='settings'&&!window._setInit){window._setInit=1;initSettings();}
   if(t.dataset.t==='files'&&!window._fmInit){window._fmInit=1;initFM();}
   if(t.dataset.t==='ssh'&&!window._sshInit){window._sshInit=1;initSSH();}
   if(t.dataset.t==='desktop'&&!window._vncInit){window._vncInit=1;
     const f=document.getElementById('vncFrame');
+    const pill=document.getElementById('vncPill'), tog=document.getElementById('vncToggle');
+    let running=false;
     const load=(q)=>{f.src='/novnc/vnc.html?path=/novnc/websockify'+q+'&autoconnect=1&resize=scale';};
-    fetch('/api/session',{method:'POST'}).then(r=>r.ok?r.json():null)
-      .then(j=>load(j?'%3Ft%3D'+encodeURIComponent(j.token):''))
-      .catch(()=>load(''));
+    const paint=()=>{ tog.textContent = running ? '⏻ Stop' : '⏻ Start';
+      pill.textContent = running ? '● VNC berjalan' : '○ VNC mati';
+      pill.style.color = running ? 'var(--ac)' : 'var(--dim)'; };
+    const chk=async()=>{ try{ const r=await (await fetch('/api/vnc')).json(); running=!!r.running; }catch(e){} paint(); };
+    tog.onclick=async()=>{ tog.disabled=true; tog.textContent='…';
+      try{ const r=await (await fetch('/api/vnc',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'toggle'})})).json();
+        running=!!r.running; }catch(e){}
+      tog.disabled=false; paint();
+      if(running && !f.src.includes('vnc.html')){
+        try{ const j=await (await fetch('/api/session',{method:'POST'})).json();
+          load('%3Ft%3D'+encodeURIComponent(j.token)); }catch(e){ load(''); }
+      }
+      if(!running){ f.src='about:blank'; }
+    };
+    chk();
     document.getElementById('vncFull').onclick=()=>f.requestFullscreen&&f.requestFullscreen();
   }
 });
@@ -493,8 +738,82 @@ async function initSSH(){
   term.onData(d=>ws.send(JSON.stringify({d})));
   new ResizeObserver(()=>{fit();try{ws.readyState===1&&ws.send(JSON.stringify({r:{c:term.cols,r:term.rows}}))}catch(e){}}).observe(document.getElementById('term'));
 }
+
+/* ===== Theme (apply secepatnya, sebelum render penuh) ===== */
+function _applyTheme(pref){
+  const eff=pref==='light'||pref==='dark'?pref:(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');
+  document.documentElement.dataset.theme=eff;
+  document.documentElement.dataset.themePref=pref;
+  document.querySelectorAll('.segbtn[data-theme]').forEach(b=>{
+    b.classList.toggle('on',b.dataset.theme===pref);
+    b.setAttribute('aria-checked',b.dataset.theme===pref);
+  });
+  const h=$('themeHint');
+  if(h)h.textContent=pref==='system'?'Mengikuti system: '+eff.toUpperCase():'Tema '+eff.toUpperCase()+' aktif';
+  if(window.term)try{term.options.theme={background:eff==='light'?'#fbfcfa':'#0b0e11'}}catch(e){}
+}
+document.documentElement.dataset.themePref=localStorage.getItem('themePref')||'system';
+_applyTheme(document.documentElement.dataset.themePref);
+matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{
+  if((document.documentElement.dataset.themePref||'system')==='system')_applyTheme('system');
+});
+document.querySelectorAll('.segbtn[data-theme]').forEach(b=>{
+  b.onclick=()=>{
+    localStorage.setItem('themePref',b.dataset.theme);
+    _applyTheme(b.dataset.theme);
+    fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({theme:b.dataset.theme})}).catch(()=>{});
+  };
+});
+
+/* ===== Settings ===== */
+function initSettings(){
+  const msg=(el,m,ok)=>{el.textContent=m;el.className='sub '+(ok?'ok':'bad')};
+  // muat pengaturan tersimpan
+  fetch('/api/settings').then(r=>r.json()).then(s=>{
+    $('setVncAuto').checked=!!s.vnc_autostart;
+    $('setPoll').value=s.poll_interval||3;
+    if(s.theme&&!localStorage.getItem('themePref'))_applyTheme(s.theme);
+  }).catch(()=>{});
+  fetch('/api/stats').then(r=>r.json()).then(s=>{
+    $('setInfo').textContent='host: '+s.hostname;
+  }).catch(()=>{});
+  // simpan pengaturan umum
+  $('setSave').onclick=async()=>{
+    const body={vnc_autostart:$('setVncAuto').checked, poll_interval:parseInt($('setPoll').value,10)};
+    try{
+      const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const j=await r.json();
+      if(!r.ok){msg($('setMsg'),j.error||'gagal',false);return}
+      window._pollInterval=body.poll_interval;
+      if(_pollTimer)clearInterval(_pollTimer);
+      _pollTimer=setInterval(poll,(window._pollInterval||3)*1000);
+      msg($('setMsg'),'Pengaturan tersimpan ✓',true);
+    }catch(e){msg($('setMsg'),'Koneksi gagal',false)}
+  };
+  // ganti password
+  $('pwSave').onclick=async()=>{
+    const o=$('pwOld').value,n=$('pwNew').value,n2=$('pwNew2').value;
+    if(!o||!n){msg($('pwMsg'),'Isi semua kolom',false);return}
+    if(n.length<8){msg($('pwMsg'),'Password baru minimal 8 karakter',false);return}
+    if(n!==n2){msg($('pwMsg'),'Ulangi password tidak sama',false);return}
+    if(n===o){msg($('pwMsg'),'Password baru sama dengan yang lama',false);return}
+    $('pwSave').disabled=true;
+    try{
+      const r=await fetch('/api/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old:o,new:n})});
+      const j=await r.json();
+      if(!r.ok){msg($('pwMsg'),j.error||'gagal ('+r.status+')',false)}
+      else{
+        msg($('pwMsg'),'Password diganti ✓ — login ulang dengan password baru',true);
+        $('pwOld').value=$('pwNew').value=$('pwNew2').value='';
+        setTimeout(()=>{fetch('/api/stats?reauth='+Date.now(),{cache:'no-store'})},800);
+      }
+    }catch(e){msg($('pwMsg'),'Koneksi gagal',false)}
+    $('pwSave').disabled=false;
+  };
+}
 </script></body></html>
 """
 
 if __name__ == "__main__":
+    _vnc_autostart_if_enabled()
     app.run(host="0.0.0.0", port=PORT)
